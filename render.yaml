@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: n8n
+    env: docker
+    repo: https://github.com/seb-hulme/n8n.git  # Replace with your forked repo URL
+    branch: master  # Use the branch you’re deploying from
+    dockerCommand: n8n
+    plan: starter
+    envVars:
+      - key: N8N_RUNNERS_ENABLED
+        value: true
+      - key: N8N_EXPRESS_TRUST_PROXY
+        value: true
+    disks:
+      - name: n8n-data
+        mountPath: /opt/render/.n8n
+        sizeGB: 1
