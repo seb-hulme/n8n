@@ -43,7 +43,7 @@
     "@codemirror/state": "catalog:",
     "@lezer/highlight": "catalog:",
     "@lezer/lr": "catalog:",
-    "@n8n/codemirror-lang": "workspace:*"
+    "@n8n/codemirror-lang": "workspace:*",
     "@lezer/common": "^1.2.0"
   },
   "devDependencies": {
