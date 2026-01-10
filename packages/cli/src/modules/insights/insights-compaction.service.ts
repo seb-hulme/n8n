@@ -1,9 +1,10 @@
+import { Logger } from '@n8n/backend-common';
 import { Service } from '@n8n/di';
-import { Logger } from 'n8n-core';
 
 import { InsightsByPeriodRepository } from './database/repositories/insights-by-period.repository';
 import { InsightsRawRepository } from './database/repositories/insights-raw.repository';
 import { InsightsConfig } from './insights.config';
+import { Time } from '@n8n/constants';
 
 /**
  * This service is responsible for compacting lower granularity insights data
@@ -11,7 +12,7 @@ import { InsightsConfig } from './insights.config';
  */
 @Service()
 export class InsightsCompactionService {
-	private compactInsightsTimer: NodeJS.Timer | undefined;
+	private compactInsightsTimer: NodeJS.Timeout | undefined;
 
 	constructor(
 		private readonly insightsByPeriodRepository: InsightsByPeriodRepository,
@@ -26,7 +27,7 @@ export class InsightsCompactionService {
 		this.stopCompactionTimer();
 		this.compactInsightsTimer = setInterval(
 			async () => await this.compactInsights(),
-			this.insightsConfig.compactionIntervalMinutes * 60 * 1000,
+			this.insightsConfig.compactionIntervalMinutes * Time.minutes.toMilliseconds,
 		);
 		this.logger.debug('Started compaction timer');
 	}

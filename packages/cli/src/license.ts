@@ -1,23 +1,25 @@
 import type { LicenseProvider } from '@n8n/backend-common';
+import { Logger } from '@n8n/backend-common';
 import { GlobalConfig } from '@n8n/config';
 import {
+	DEFAULT_WORKFLOW_HISTORY_PRUNE_LIMIT,
 	LICENSE_FEATURES,
 	LICENSE_QUOTAS,
+	Time,
 	UNLIMITED_LICENSE_QUOTA,
 	type BooleanLicenseFeature,
 	type NumericLicenseFeature,
 } from '@n8n/constants';
 import { SettingsRepository } from '@n8n/db';
-import { OnLeaderStepdown, OnLeaderTakeover, OnShutdown } from '@n8n/decorators';
+import { OnLeaderStepdown, OnLeaderTakeover, OnPubSubEvent, OnShutdown } from '@n8n/decorators';
 import { Container, Service } from '@n8n/di';
-import type { TEntitlement, TFeatures, TLicenseBlock } from '@n8n_io/license-sdk';
+import type { TEntitlement, TLicenseBlock } from '@n8n_io/license-sdk';
 import { LicenseManager } from '@n8n_io/license-sdk';
-import { InstanceSettings, Logger } from 'n8n-core';
+import { InstanceSettings } from 'n8n-core';
 
-import config from '@/config';
 import { LicenseMetricsService } from '@/metrics/license-metrics.service';
 
-import { N8N_VERSION, SETTINGS_LICENSE_CERT_KEY, Time } from './constants';
+import { N8N_VERSION, SETTINGS_LICENSE_CERT_KEY } from './constants';
 
 const LICENSE_RENEWAL_DISABLED_WARNING =
 	'Automatic license renewal is disabled. The license will not renew automatically, and access to licensed features may be lost!';
@@ -28,11 +30,15 @@ export type FeatureReturnType = Partial<
 	} & { [K in NumericLicenseFeature]: number } & { [K in BooleanLicenseFeature]: boolean }
 >;
 
+type LicenseRefreshCallback = (cert: string) => void;
+
 @Service()
 export class License implements LicenseProvider {
 	private manager: LicenseManager | undefined;
 
 	private isShuttingDown = false;
+
+	private refreshCallbacks: LicenseRefreshCallback[] = [];
 
 	constructor(
 		private readonly logger: Logger,
@@ -66,7 +72,10 @@ export class License implements LicenseProvider {
 			? async (value: TLicenseBlock) => await this.saveCertStr(value)
 			: async () => {};
 		const onFeatureChange = isMainInstance
-			? async (features: TFeatures) => await this.onFeatureChange(features)
+			? async () => await this.onFeatureChange()
+			: async () => {};
+		const onLicenseRenewed = isMainInstance
+			? async () => await this.onLicenseRenewed()
 			: async () => {};
 		const collectUsageMetrics = isMainInstance
 			? async () => await this.licenseMetricsService.collectUsageMetrics()
@@ -74,6 +83,8 @@ export class License implements LicenseProvider {
 		const collectPassthroughData = isMainInstance
 			? async () => await this.licenseMetricsService.collectPassthroughData()
 			: async () => ({});
+		const onExpirySoon = !this.instanceSettings.isLeader ? () => this.onExpirySoon() : undefined;
+		const expirySoonOffsetMins = !this.instanceSettings.isLeader ? 120 : undefined;
 
 		const { isLeader } = this.instanceSettings;
 		const { autoRenewalEnabled } = this.globalConfig.license;
@@ -102,12 +113,12 @@ export class License implements LicenseProvider {
 				collectUsageMetrics,
 				collectPassthroughData,
 				onFeatureChange,
+				onLicenseRenewed,
+				onExpirySoon,
+				expirySoonOffsetMins,
 			});
 
 			await this.manager.initialize();
-
-			const features = this.manager.getFeatures();
-			this.checkIsLicensedForMultiMain(features);
 
 			this.logger.debug('License initialized');
 		} catch (error: unknown) {
@@ -132,26 +143,18 @@ export class License implements LicenseProvider {
 		return databaseSettings?.value ?? '';
 	}
 
-	async onFeatureChange(_features: TFeatures): Promise<void> {
-		const { isMultiMain, isLeader } = this.instanceSettings;
+	private async onFeatureChange() {
+		void this.broadcastReloadLicenseCommand();
+		await this.notifyRefreshCallbacks();
+	}
 
-		if (Object.keys(_features).length === 0) {
-			this.logger.error('Empty license features recieved', { isMultiMain, isLeader });
-			return;
-		}
+	private async onLicenseRenewed() {
+		void this.broadcastReloadLicenseCommand();
+		await this.notifyRefreshCallbacks();
+	}
 
-		this.logger.debug('License feature change detected', _features);
-
-		this.checkIsLicensedForMultiMain(_features);
-
-		if (isMultiMain && !isLeader) {
-			this.logger
-				.scoped(['scaling', 'multi-main-setup', 'license'])
-				.debug('Instance is not leader, skipping sending of "reload-license" command...');
-			return;
-		}
-
-		if (config.getEnv('executions.mode') === 'queue') {
+	private async broadcastReloadLicenseCommand() {
+		if (this.globalConfig.executions.mode === 'queue' && this.instanceSettings.isLeader) {
 			const { Publisher } = await import('@/scaling/pubsub/publisher.service');
 			await Container.get(Publisher).publishCommand({ command: 'reload-license' });
 		}
@@ -170,20 +173,47 @@ export class License implements LicenseProvider {
 		);
 	}
 
-	async activate(activationKey: string): Promise<void> {
+	/**
+	 * Register a callback to be notified when license certificate is refreshed.
+	 * Returns an unsubscribe function.
+	 */
+	onCertRefresh(refreshCallback: LicenseRefreshCallback): () => void {
+		this.refreshCallbacks.push(refreshCallback);
+		return () => {
+			const index = this.refreshCallbacks.indexOf(refreshCallback);
+			if (index > -1) {
+				this.refreshCallbacks.splice(index, 1);
+			}
+		};
+	}
+
+	private async notifyRefreshCallbacks(): Promise<void> {
+		const cert = await this.loadCertStr();
+		for (const refreshCallback of this.refreshCallbacks) {
+			try {
+				refreshCallback(cert);
+			} catch (error) {
+				this.logger.error('Error in license refresh callback', { error });
+			}
+		}
+	}
+
+	async activate(activationKey: string, eulaUri?: string): Promise<void> {
 		if (!this.manager) {
 			return;
 		}
 
-		await this.manager.activate(activationKey);
+		await this.manager.activate(activationKey, eulaUri);
 		this.logger.debug('License activated');
 	}
 
+	@OnPubSubEvent('reload-license')
 	async reload(): Promise<void> {
 		if (!this.manager) {
 			return;
 		}
 		await this.manager.reload();
+		await this.notifyRefreshCallbacks();
 		this.logger.debug('License reloaded');
 	}
 
@@ -221,6 +251,11 @@ export class License implements LicenseProvider {
 
 	isLicensed(feature: BooleanLicenseFeature) {
 		return this.manager?.hasFeatureEnabled(feature) ?? false;
+	}
+
+	/** @deprecated Use `LicenseState.isDynamicCredentialsLicensed` instead. */
+	isDynamicCredentialsEnabled() {
+		return this.isLicensed(LICENSE_FEATURES.DYNAMIC_CREDENTIALS);
 	}
 
 	/** @deprecated Use `LicenseState.isSharingLicensed` instead. */
@@ -301,11 +336,6 @@ export class License implements LicenseProvider {
 	/** @deprecated Use `LicenseState.isExternalSecretsLicensed` instead. */
 	isExternalSecretsEnabled() {
 		return this.isLicensed(LICENSE_FEATURES.EXTERNAL_SECRETS);
-	}
-
-	/** @deprecated Use `LicenseState.isWorkflowHistoryLicensed` instead. */
-	isWorkflowHistoryLicensed() {
-		return this.isLicensed(LICENSE_FEATURES.WORKFLOW_HISTORY);
 	}
 
 	/** @deprecated Use `LicenseState.isAPIDisabled` instead. */
@@ -406,7 +436,10 @@ export class License implements LicenseProvider {
 
 	/** @deprecated Use `LicenseState` instead. */
 	getWorkflowHistoryPruneLimit() {
-		return this.getValue(LICENSE_QUOTAS.WORKFLOW_HISTORY_PRUNE_LIMIT) ?? UNLIMITED_LICENSE_QUOTA;
+		return (
+			this.getValue(LICENSE_QUOTAS.WORKFLOW_HISTORY_PRUNE_LIMIT) ??
+			DEFAULT_WORKFLOW_HISTORY_PRUNE_LIMIT
+		);
 	}
 
 	/** @deprecated Use `LicenseState` instead. */
@@ -431,30 +464,6 @@ export class License implements LicenseProvider {
 		return this.getUsersLimit() === UNLIMITED_LICENSE_QUOTA;
 	}
 
-	/**
-	 * Ensures that the instance is licensed for multi-main setup if multi-main mode is enabled
-	 */
-	private checkIsLicensedForMultiMain(features: TFeatures) {
-		const isMultiMainEnabled =
-			config.getEnv('executions.mode') === 'queue' && this.globalConfig.multiMainSetup.enabled;
-		if (!isMultiMainEnabled) {
-			return;
-		}
-
-		const isMultiMainLicensed =
-			(features[LICENSE_FEATURES.MULTIPLE_MAIN_INSTANCES] as boolean | undefined) ?? false;
-
-		this.instanceSettings.setMultiMainLicensed(isMultiMainLicensed);
-
-		if (!isMultiMainLicensed) {
-			this.logger
-				.scoped(['scaling', 'multi-main-setup', 'license'])
-				.debug(
-					'License changed with no support for multi-main setup - no new followers will be allowed to init. To restore multi-main setup, please upgrade to a license that supports this feature.',
-				);
-		}
-	}
-
 	@OnLeaderTakeover()
 	enableAutoRenewals() {
 		this.manager?.enableAutoRenewals();
@@ -463,5 +472,21 @@ export class License implements LicenseProvider {
 	@OnLeaderStepdown()
 	disableAutoRenewals() {
 		this.manager?.disableAutoRenewals();
+	}
+
+	private onExpirySoon() {
+		this.logger.info('License is about to expire soon, reloading license...');
+
+		// reload in background to avoid blocking SDK
+
+		void this.reload()
+			.then(() => {
+				this.logger.info('Reloaded license on expiry soon');
+			})
+			.catch((error) => {
+				this.logger.error('Failed to reload license on expiry soon', {
+					error: error instanceof Error ? error.message : error,
+				});
+			});
 	}
 }

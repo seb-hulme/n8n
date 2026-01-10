@@ -6,10 +6,12 @@ import { Embeddings } from '@langchain/core/embeddings';
 import type { InputValues, MemoryVariables, OutputValues } from '@langchain/core/memory';
 import type { BaseMessage } from '@langchain/core/messages';
 import { BaseRetriever } from '@langchain/core/retrievers';
+import { BaseDocumentCompressor } from '@langchain/core/retrievers/document_compressors';
 import type { StructuredTool, Tool } from '@langchain/core/tools';
 import { VectorStore } from '@langchain/core/vectorstores';
 import { TextSplitter } from '@langchain/textsplitters';
-import type { BaseDocumentLoader } from 'langchain/dist/document_loaders/base';
+import type { BaseDocumentLoader } from '@langchain/classic/dist/document_loaders/base';
+import { OpenAIEmbeddings, AzureOpenAIEmbeddings } from '@langchain/openai';
 import type {
 	IDataObject,
 	IExecuteFunctions,
@@ -18,8 +20,17 @@ import type {
 	ITaskMetadata,
 	NodeConnectionType,
 } from 'n8n-workflow';
-import { NodeOperationError, NodeConnectionTypes, parseErrorMetadata } from 'n8n-workflow';
+import {
+	NodeOperationError,
+	NodeConnectionTypes,
+	parseErrorMetadata,
+	deepCopy,
+} from 'n8n-workflow';
 
+import {
+	validateEmbedQueryInput,
+	validateEmbedDocumentsInput,
+} from './embeddings/embeddingInputValidation';
 import { logAiEvent, isToolsInstance, isBaseChatMemory, isBaseChatMessageHistory } from './helpers';
 import { N8nBinaryLoader } from './N8nBinaryLoader';
 import { N8nJsonLoader } from './N8nJsonLoader';
@@ -102,7 +113,10 @@ export function logWrapper<
 		| BaseChatMemory
 		| BaseChatMessageHistory
 		| BaseRetriever
+		| BaseDocumentCompressor
 		| Embeddings
+		| OpenAIEmbeddings
+		| AzureOpenAIEmbeddings
 		| Document[]
 		| Document
 		| BaseDocumentLoader
@@ -128,7 +142,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [values],
 						})) as MemoryVariables;
 
@@ -151,7 +165,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [input, output],
 						})) as MemoryVariables;
 
@@ -179,7 +193,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [],
 						})) as BaseMessage[];
 
@@ -199,7 +213,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [message],
 						});
 
@@ -225,7 +239,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query, config],
 						})) as Array<Document<Record<string, any>>>;
 
@@ -253,21 +267,31 @@ export function logWrapper<
 			}
 
 			// ========== Embeddings ==========
-			if (originalInstance instanceof Embeddings) {
+			if (
+				originalInstance instanceof Embeddings ||
+				originalInstance instanceof OpenAIEmbeddings ||
+				originalInstance instanceof AzureOpenAIEmbeddings
+			) {
 				// Docs -> Embeddings
 				if (prop === 'embedDocuments' && 'embedDocuments' in target) {
 					return async (documents: string[]): Promise<number[][]> => {
+						// Validate documents input before embedding
+						const validatedDocuments = validateEmbedDocumentsInput(
+							documents,
+							executeFunctions.getNode(),
+						);
+
 						connectionType = NodeConnectionTypes.AiEmbedding;
 						const { index } = executeFunctions.addInputData(connectionType, [
-							[{ json: { documents } }],
+							[{ json: { documents: validatedDocuments } }],
 						]);
 
 						const response = (await callMethodAsync.call(target, {
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
-							arguments: [documents],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
+							arguments: [validatedDocuments],
 						})) as number[][];
 
 						logAiEvent(executeFunctions, 'ai-document-embedded');
@@ -278,19 +302,49 @@ export function logWrapper<
 				// Query -> Embeddings
 				if (prop === 'embedQuery' && 'embedQuery' in target) {
 					return async (query: string): Promise<number[]> => {
+						// Validate query input before embedding
+						const validatedQuery = validateEmbedQueryInput(query, executeFunctions.getNode());
+
 						connectionType = NodeConnectionTypes.AiEmbedding;
 						const { index } = executeFunctions.addInputData(connectionType, [
-							[{ json: { query } }],
+							[{ json: { query: validatedQuery } }],
 						]);
 
 						const response = (await callMethodAsync.call(target, {
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
-							arguments: [query],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
+							arguments: [validatedQuery],
 						})) as number[];
+
 						logAiEvent(executeFunctions, 'ai-query-embedded');
+						executeFunctions.addOutputData(connectionType, index, [[{ json: { response } }]]);
+						return response;
+					};
+				}
+			}
+
+			// ========== Rerankers ==========
+			if (originalInstance instanceof BaseDocumentCompressor) {
+				if (prop === 'compressDocuments' && 'compressDocuments' in target) {
+					return async (documents: Document[], query: string): Promise<Document[]> => {
+						connectionType = NodeConnectionTypes.AiReranker;
+						const { index } = executeFunctions.addInputData(connectionType, [
+							[{ json: { query, documents } }],
+						]);
+
+						const response = (await callMethodAsync.call(target, {
+							executeFunctions,
+							connectionType,
+							currentNodeRunIndex: index,
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
+							// compressDocuments mutates the original object
+							// messing up the input data logging
+							arguments: [deepCopy(documents), query],
+						})) as Document[];
+
+						logAiEvent(executeFunctions, 'ai-document-reranked', { query });
 						executeFunctions.addOutputData(connectionType, index, [[{ json: { response } }]]);
 						return response;
 					};
@@ -312,7 +366,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [items],
 						})) as number[];
 
@@ -331,7 +385,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [item, itemIndex],
 						})) as number[];
 
@@ -357,7 +411,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [text],
 						})) as string[];
 
@@ -389,7 +443,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query],
 						})) as string;
 
@@ -408,8 +462,8 @@ export function logWrapper<
 					return async (
 						query: string,
 						k?: number,
-						filter?: BiquadFilterType | undefined,
-						_callbacks?: Callbacks | undefined,
+						filter?: BiquadFilterType,
+						_callbacks?: Callbacks,
 					): Promise<Document[]> => {
 						connectionType = NodeConnectionTypes.AiVectorStore;
 						const { index } = executeFunctions.addInputData(connectionType, [
@@ -420,7 +474,7 @@ export function logWrapper<
 							executeFunctions,
 							connectionType,
 							currentNodeRunIndex: index,
-							method: target[prop],
+							method: target[prop] as (...args: any[]) => Promise<unknown>,
 							arguments: [query, k, filter, _callbacks],
 						})) as Array<Document<Record<string, any>>>;
 

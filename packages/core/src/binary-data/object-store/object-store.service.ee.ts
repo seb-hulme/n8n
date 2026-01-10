@@ -14,12 +14,11 @@ import {
 	DeleteObjectsCommand,
 	ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
+import { Logger } from '@n8n/backend-common';
 import { Service } from '@n8n/di';
 import { UnexpectedError } from 'n8n-workflow';
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
-
-import { Logger } from '@/logging/logger';
 
 import { ObjectStoreConfig } from './object-store.config';
 import type { MetadataResponseHeaders } from './types';
@@ -108,14 +107,15 @@ export class ObjectStoreService {
 			};
 
 			if (metadata.fileName) {
-				params.Metadata = { filename: metadata.fileName };
+				params.Metadata = { filename: encodeURIComponent(metadata.fileName) };
 			}
 
 			if (metadata.mimeType) {
 				params.ContentType = metadata.mimeType;
 			}
 
-			this.logger.debug('Sending PUT request to S3', { params });
+			const { Body: _body, ...logParams } = params;
+			this.logger.debug('Sending PUT request to S3', { params: logParams });
 			const command = new PutObjectCommand(params);
 			return await this.s3Client.send(command);
 		} catch (e) {
@@ -175,7 +175,8 @@ export class ObjectStoreService {
 			// Add metadata with the expected prefix format
 			if (response.Metadata) {
 				Object.entries(response.Metadata).forEach(([key, value]) => {
-					headers[`x-amz-meta-${key.toLowerCase()}`] = value;
+					headers[`x-amz-meta-${key.toLowerCase()}`] =
+						key === 'filename' ? decodeURIComponent(value) : value;
 				});
 			}
 

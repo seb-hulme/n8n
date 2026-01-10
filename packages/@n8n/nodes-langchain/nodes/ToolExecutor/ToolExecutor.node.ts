@@ -1,5 +1,5 @@
 import { Tool, StructuredTool } from '@langchain/core/tools';
-import type { Toolkit } from 'langchain/agents';
+import type { Toolkit } from '@langchain/classic/agents';
 import type {
 	IExecuteFunctions,
 	INodeExecutionData,
@@ -75,8 +75,8 @@ export class ToolExecutor implements INodeType {
 					}
 				} else {
 					// Handle single tool
-					if (!toolName || toolName === (tool as Tool).name) {
-						const result = await executeTool(tool as Tool, parsedQuery);
+					if (!toolName || toolName === tool.name) {
+						const result = await executeTool(tool, parsedQuery);
 						resultData.push(result);
 					}
 				}
