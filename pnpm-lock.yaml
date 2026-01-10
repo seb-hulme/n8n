@@ -2150,6 +2150,9 @@ importers:
       '@types/mime-types':
         specifier: 'catalog:'
         version: 3.0.1
+      '@types/ms':
+        specifier: ^2.1.0
+        version: 2.1.0
       '@types/proxy-from-env':
         specifier: ^1.0.4
         version: 1.0.4
